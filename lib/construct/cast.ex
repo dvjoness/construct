@@ -7,7 +7,7 @@ defmodule Construct.Cast do
 
   @default_value :__construct_no_default_value__
 
-  @type type :: {Construct.Type.t, Keyword.t}
+  @type type :: {Construct.Type.t(), Keyword.t()}
   @type types :: %{required(atom) => type}
   @type options :: [error_values: boolean, make_map: boolean, empty_values: list(term)]
 
@@ -45,12 +45,6 @@ defmodule Construct.Cast do
       iex> make(%{age: {:integer, [default: 18]}}, %{})
       {:ok, %{age: 18}}
 
-      iex> make(%{age: {:integer, [optional: true]}}, %{})
-      {:ok, %{}}
-
-      iex> make(%{age: {:integer, [optional: true, default: 42]}, name: {:string, []}}, %{"name" => "john doe"})
-      {:ok, %{age: 42, name: "john doe"}}
-
       iex> types = %{title: {:string, []}, comments: {{:array, :string}, default: []}}
       iex> make(types, %{title: "article", comments: ["awesome", "great!", "whoa!"]})
       {:ok, %{title: "article", comments: ["awesome", "great!", "whoa!"]}}
@@ -71,11 +65,13 @@ defmodule Construct.Cast do
       iex> make(%{name: {:string, []}}, %{name: "john"}, empty_values: ["john"])
       {:error, %{name: :missing}}
   """
-  @spec make(atom | types, map, options) :: {:ok, Construct.t | map} | {:error, term}
+  @spec make(atom | types, map, options) :: {:ok, Construct.t() | map} | {:error, term}
   def make(struct_or_types, params, opts \\ [])
+
   def make(module, params, opts) when is_atom(module) do
     make_struct(make_struct_instance(module), collect_types(module), params, opts)
   end
+
   def make(types, params, opts) do
     cast_params(types, params, opts)
   end
@@ -111,6 +107,7 @@ defmodule Construct.Cast do
         else
           {:ok, struct(struct, changes)}
         end
+
       {:error, errors} ->
         {:error, errors}
     end
@@ -122,40 +119,43 @@ defmodule Construct.Cast do
     types = convert_types(types)
     permitted = Map.keys(types)
 
-    case Enum.reduce(permitted, {%{}, %{}, true},
-                     &process_param(&1, params, types, empty_values, opts, &2)) do
-      {changes, _errors, true} -> {:ok, changes}
-      {_changes, errors, false} -> {:error, errors}
+    case Enum.reduce(permitted, {%{}, %{}, true}, &process_param(&1, params, types, empty_values, opts, &2)) do
+      {changes, _errors, true} ->
+        {:ok, changes}
+      {_changes, errors, false} ->
+        {:error, errors}
     end
   end
 
   defp convert_params(%{__struct__: _} = params) do
     convert_params(Map.from_struct(params))
   end
+
   defp convert_params(params) when is_list(params) or is_map(params) do
     Enum.reduce(params, nil, fn
-      ({key, _value}, nil) when is_binary(key) ->
+      {key, _value}, nil when is_binary(key) ->
         nil
 
-      ({key, _value}, _) when is_binary(key) ->
-        raise Construct.MakeError, "expected params to be a map or keyword list with atom or string keys, " <>
-                                   "got a map with mixed keys: #{inspect(params)}"
+      {key, _value}, _ when is_binary(key) ->
+        raise Construct.MakeError,
+              "expected params to be a map or keyword list with atom or string keys, " <>
+                "got a map with mixed keys: #{inspect(params)}"
 
-      ({key, value}, nil) when is_atom(key) ->
+      {key, value}, nil when is_atom(key) ->
         [{Atom.to_string(key), value}]
 
-      ({key, value}, acc) when is_atom(key) ->
+      {key, value}, acc when is_atom(key) ->
         [{Atom.to_string(key), value} | acc]
 
-      (invalid_kv, _acc) ->
+      invalid_kv, _acc ->
         raise Construct.MakeError, "expected params to be a {key, value} structure, got: #{inspect(invalid_kv)}"
-
     end)
     |> case do
-         nil -> params
-         list -> Enum.into(list, %{})
-       end
+      nil -> params
+      list -> Enum.into(list, %{})
+    end
   end
+
   defp convert_params(params) do
     params
   end
@@ -163,9 +163,11 @@ defmodule Construct.Cast do
   defp convert_types(types) when is_map(types) do
     types
   end
+
   defp convert_types(types) when is_list(types) do
     Enum.into(types, %{})
   end
+
   defp convert_types(invalid_types) do
     raise Construct.Error, "expected types to be a {key, value} structure, got: #{inspect(invalid_types)}"
   end
@@ -175,19 +177,21 @@ defmodule Construct.Cast do
     {type, type_opts} = type!(key, types)
 
     case cast_field(param_key, type, type_opts, params, empty_values, opts) do
-      {:ok, :skip} ->
-        {changes, errors, valid?}
       {:ok, value} ->
         {Map.put(changes, key, value), errors, valid?}
+
       {:error, reason} ->
         {changes, Map.put(errors, key, reason), false}
+
+      {:skip, :optional} ->
+        {changes, errors, valid?}
     end
   end
 
   defp type!(key, types) do
     case types do
       %{^key => {type, []}} -> {type, []}
-      %{^key => {type, [{_,_}|_] = type_opts}} -> {type, type_opts}
+      %{^key => {type, [{_, _} | _] = type_opts}} -> {type, type_opts}
       %{^key => type} -> {type, []}
       _ -> raise Construct.Error, "unknown field `#{key}`"
     end
@@ -195,7 +199,7 @@ defmodule Construct.Cast do
 
   defp cast_field(param_key, type, type_opts, params, empty_values, opts) do
     default_value = Keyword.get(type_opts, :default, @default_value)
-    optional_parameter? = Keyword.get(type_opts, :optional, false)
+    is_optional_field = Keyword.get(type_opts, :optional, false)
     error_values = Keyword.get(opts, :error_values, false)
 
     case params do
@@ -211,22 +215,22 @@ defmodule Construct.Cast do
 
       _ ->
         cond do
-          optional_parameter? && default_value != @default_value ->
-            {:ok, make_default_value(default_value)}
-          optional_parameter? && default_value == @default_value ->
-            {:ok, :skip}
+          is_optional_field && default_value == @default_value ->
+            {:skip, :optional}
+
           default_value == @default_value ->
             put_value(type, error_values, nil, {:error, :missing})
+
           true ->
             {:ok, make_default_value(default_value)}
         end
-
     end
   end
 
   defp make_default_value(value) when is_function(value, 0) do
     value.()
   end
+
   defp make_default_value(value) do
     value
   end
@@ -239,13 +243,17 @@ defmodule Construct.Cast do
         else
           {:ok, value}
         end
+
       {:error, reason} ->
         {:error, reason}
+
       :error ->
         {:error, :invalid}
+
       any ->
-        raise Construct.MakeError, "expected #{inspect(type)} to return {:ok, term} | {:error, term} | :error, " <>
-                                   "got an unexpected value: `#{inspect(any)}`"
+        raise Construct.MakeError,
+              "expected #{inspect(type)} to return {:ok, term} | {:error, term} | :error, " <>
+                "got an unexpected value: `#{inspect(any)}`"
     end
   end
 
